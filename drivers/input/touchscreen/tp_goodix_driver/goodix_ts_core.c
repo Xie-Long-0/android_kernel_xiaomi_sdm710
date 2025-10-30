@@ -2051,12 +2051,20 @@ int goodix_ts_fb_notifier_callback(struct notifier_block *self,
 	if (fb_event && fb_event->data && core_data) {
 		blank = *(int *)(fb_event->data);
 		flush_workqueue(core_data->event_wq);
-		if (event == MSM_DRM_EVENT_BLANK && (blank == MSM_DRM_BLANK_POWERDOWN ||
-			blank == MSM_DRM_BLANK_LP1 || blank == MSM_DRM_BLANK_LP2)) {
+		if (event == MSM_DRM_EVENT_BLANK && blank == MSM_DRM_BLANK_POWERDOWN) {
 			if (atomic_read(&core_data->suspend_stat))
 				return 0;
-			ts_info("suspend by %s", blank == MSM_DRM_BLANK_POWERDOWN ? "blank" :
-			"doze");
+			ts_info("suspend by blank");
+			/* TODO: Add a implementation to turn gesture mode on when
+			         screen off UDFPS is eanbled but not DT2W.
+			*/
+			core_data->aod_status = 1; /* Temporary solution */
+			queue_work(core_data->event_wq, &core_data->suspend_work);
+		} else if (event == MSM_DRM_EVENT_BLANK &&
+			(blank == MSM_DRM_BLANK_LP1 || blank == MSM_DRM_BLANK_LP2)) {
+			if (atomic_read(&core_data->suspend_stat))
+				return 0;
+			ts_info("suspend by doze");
 			core_data->aod_status = 1;
 			queue_work(core_data->event_wq, &core_data->suspend_work);
 		} else if (event == MSM_DRM_EVENT_BLANK && blank == MSM_DRM_BLANK_UNBLANK) {
