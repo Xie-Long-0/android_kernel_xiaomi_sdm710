@@ -819,10 +819,6 @@ static ssize_t double_tap_store(struct kobject *kobj,
 	return -EINVAL;
 
 	goodix_core_data->double_wakeup = !!val;
-	goodix_core_data->gesture_enabled =
-		goodix_core_data->double_wakeup ||
-		goodix_core_data->fod_status ||
-		goodix_core_data->aod_status;
 
 	return count;
 }
@@ -1473,7 +1469,6 @@ static ssize_t fod_status_store(struct kobject *kobj,
 	ts_info("buf:%s, count:%zu\n", buf, count);
 	sscanf(buf, "%u", &goodix_core_data->fod_status);
 
-	goodix_core_data->gesture_enabled = goodix_core_data->double_wakeup | goodix_core_data->fod_status;
 	goodix_check_gesture_stat(!!goodix_core_data->fod_status);
 
 	return count;
@@ -1496,10 +1491,11 @@ static void goodix_switch_mode_work(struct work_struct *work)
 	if (value >= INPUT_EVENT_WAKUP_MODE_OFF
 		&& value <= INPUT_EVENT_WAKUP_MODE_ON) {
 		info->double_wakeup = value - INPUT_EVENT_WAKUP_MODE_OFF;
-		info->gesture_enabled = info->double_wakeup ||
-			info->fod_status || info->aod_status;
-		/*goodix_gesture_enable(!!info->gesture_enabled);*/
 	}
+
+	info->gesture_enabled =
+		goodix_core_data->double_wakeup || goodix_core_data->aod_status;
+	/*goodix_gesture_enable(!!info->gesture_enabled);*/
 }
 
 static int goodix_input_event(struct input_dev *dev, unsigned int type,
@@ -2055,12 +2051,18 @@ int goodix_ts_fb_notifier_callback(struct notifier_block *self,
 	if (fb_event && fb_event->data && core_data) {
 		blank = *(int *)(fb_event->data);
 		flush_workqueue(core_data->event_wq);
-		if (event == MSM_DRM_EVENT_BLANK && (blank == MSM_DRM_BLANK_POWERDOWN ||
-			blank == MSM_DRM_BLANK_LP1 || blank == MSM_DRM_BLANK_LP2)) {
+		if (event == MSM_DRM_EVENT_BLANK && blank == MSM_DRM_BLANK_POWERDOWN) {
 			if (atomic_read(&core_data->suspend_stat))
 				return 0;
-			ts_info("suspend by %s", blank == MSM_DRM_BLANK_POWERDOWN ? "blank" :
-			"doze");
+			ts_info("suspend by blank");
+			core_data->aod_status = 1; /* Temporary solution */
+			/* TODO: If screen off UDFPS is on, turn gesture mode on */
+			queue_work(core_data->event_wq, &core_data->suspend_work);
+		} else if (event == MSM_DRM_EVENT_BLANK &&
+			(blank == MSM_DRM_BLANK_LP1 || blank == MSM_DRM_BLANK_LP2)) {
+			if (atomic_read(&core_data->suspend_stat))
+				return 0;
+			ts_info("suspend by doze");
 			core_data->aod_status = 1;
 			queue_work(core_data->event_wq, &core_data->suspend_work);
 		} else if (event == MSM_DRM_EVENT_BLANK && blank == MSM_DRM_BLANK_UNBLANK) {
@@ -2071,6 +2073,9 @@ int goodix_ts_fb_notifier_callback(struct notifier_block *self,
 			queue_work(core_data->event_wq, &core_data->resume_work);
 		}
 	}
+
+	core_data->gesture_enabled =
+		core_data->double_wakeup || core_data->aod_status;
 
 	return 0;
 }

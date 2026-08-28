@@ -1160,16 +1160,15 @@ static ssize_t double_tap_store(struct kobject *kobj,
 
 	rc = kstrtoint(buf, 10, &val);
 	if (rc)
-	return -EINVAL;
+		return -EINVAL;
 
-	ms = (struct fts_mode_switch *)kmalloc(sizeof(struct fts_mode_switch), GFP_ATOMIC);
-	if (ms == NULL)
-	return -EINVAL;
+	ms = kmalloc(sizeof(struct fts_mode_switch), GFP_KERNEL);
+	if (!ms)
+		return -EINVAL;
 
 	ms->info = fts_info;
-	ms->mode = (unsigned char)!!val;
-	INIT_WORK(&ms->switch_mode_work,
-			fts_switch_mode_work);
+	ms->mode = val ? INPUT_EVENT_WAKUP_MODE_ON : INPUT_EVENT_WAKUP_MODE_OFF;
+	INIT_WORK(&ms->switch_mode_work, fts_switch_mode_work);
 	schedule_work(&ms->switch_mode_work);
 
 	return count;
@@ -3745,7 +3744,8 @@ static int fts_drm_state_chg_callback(struct notifier_block *nb,
 
 		flush_workqueue(info->event_wq);
 
-		if (val == MSM_DRM_EARLY_EVENT_BLANK && blank == MSM_DRM_BLANK_POWERDOWN) {
+		if (val == MSM_DRM_EARLY_EVENT_BLANK && (blank == MSM_DRM_BLANK_POWERDOWN
+			|| blank == MSM_DRM_BLANK_LP1 || blank == MSM_DRM_BLANK_LP2)) {
 			if (info->sensor_sleep)
 				return NOTIFY_OK;
 
@@ -4951,6 +4951,8 @@ static int fts_probe(struct spi_device *client)
 	error = fts_proc_init();
 	if (error < OK)
 		logError(1, "%s Error: can not create /proc file! \n", tag);
+
+	device_init_wakeup(&client->dev, 1);
 
 #ifdef CONFIG_TOUCHSCREEN_ST_DEBUG_FS
 	info->debugfs = debugfs_create_dir("tp_debug", NULL);
