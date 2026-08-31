@@ -4161,8 +4161,6 @@ int dsi_panel_set_lp1(struct dsi_panel *panel)
 {
 	int rc = 0;
 
-	panel->doze_status = true;
-
 	if (!panel) {
 		pr_err("invalid params\n");
 		return -EINVAL;
@@ -4176,6 +4174,8 @@ int dsi_panel_set_lp1(struct dsi_panel *panel)
 	if (rc)
 		pr_err("[%s] failed to send DSI_CMD_SET_LP1 cmd, rc=%d\n",
 		       panel->name, rc);
+	else
+		panel->doze_status = true;
 
 	mutex_unlock(&panel->panel_lock);
 
@@ -4190,8 +4190,6 @@ int dsi_panel_set_lp2(struct dsi_panel *panel)
 {
 	int rc = 0;
 
-	panel->doze_status = true;
-
 	if (!panel) {
 		pr_err("invalid params\n");
 		return -EINVAL;
@@ -4205,6 +4203,8 @@ int dsi_panel_set_lp2(struct dsi_panel *panel)
 	if (rc)
 		pr_err("[%s] failed to send DSI_CMD_SET_LP2 cmd, rc=%d\n",
 		       panel->name, rc);
+	else
+		panel->doze_status = true;
 
 	mutex_unlock(&panel->panel_lock);
 
