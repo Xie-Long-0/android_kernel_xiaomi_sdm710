@@ -415,7 +415,7 @@ static int create_autodetect_quirks(struct snd_usb_audio *chip,
 }
 
 /*
- * Create a stream for an Edirol UA-700/UA-25/UA-4FX interface.  
+ * Create a stream for an Edirol UA-700/UA-25/UA-4FX interface.
  * The only way to detect the sample rate is by looking at wMaxPacketSize.
  */
 static int create_uaxx_quirk(struct snd_usb_audio *chip,
@@ -602,7 +602,7 @@ static int snd_usb_extigy_boot_quirk(struct usb_device *dev, struct usb_interfac
 				new_device_descriptor, sizeof(*new_device_descriptor));
 		if (err < 0)
 			dev_dbg(&dev->dev, "error usb_get_descriptor: %d\n", err);
-		if (new_device_descriptor->bNumConfigurations > dev->descriptor.bNumConfigurations)
+		else if (new_device_descriptor->bNumConfigurations > dev->descriptor.bNumConfigurations)
 			dev_dbg(&dev->dev, "error too large bNumConfigurations: %d\n",
 				new_device_descriptor->bNumConfigurations);
 		else
@@ -860,7 +860,7 @@ static int snd_usb_mbox2_boot_quirk(struct usb_device *dev)
 		new_device_descriptor, sizeof(*new_device_descriptor));
 	if (err < 0)
 		dev_dbg(&dev->dev, "error usb_get_descriptor: %d\n", err);
-	if (new_device_descriptor->bNumConfigurations > dev->descriptor.bNumConfigurations)
+	else if (new_device_descriptor->bNumConfigurations > dev->descriptor.bNumConfigurations)
 		dev_dbg(&dev->dev, "error too large bNumConfigurations: %d\n",
 			new_device_descriptor->bNumConfigurations);
 	else
