@@ -84,25 +84,26 @@
 #include <trace/events/fib.h>
 #include "fib_lookup.h"
 
-static BLOCKING_NOTIFIER_HEAD(fib_chain);
+static ATOMIC_NOTIFIER_HEAD(fib_chain);
 
 int register_fib_notifier(struct notifier_block *nb)
 {
-	return blocking_notifier_chain_register(&fib_chain, nb);
+	return atomic_notifier_chain_register(&fib_chain, nb);
 }
 EXPORT_SYMBOL(register_fib_notifier);
 
 int unregister_fib_notifier(struct notifier_block *nb)
 {
-	return blocking_notifier_chain_unregister(&fib_chain, nb);
+	return atomic_notifier_chain_unregister(&fib_chain, nb);
 }
 EXPORT_SYMBOL(unregister_fib_notifier);
 
 int call_fib_notifiers(struct net *net, enum fib_event_type event_type,
 		       struct fib_notifier_info *info)
 {
+	net->ipv4.fib_seq++;
 	info->net = net;
-	return blocking_notifier_call_chain(&fib_chain, event_type, info);
+	return atomic_notifier_call_chain(&fib_chain, event_type, info);
 }
 
 static int call_fib_entry_notifiers(struct net *net,
@@ -1554,8 +1555,8 @@ int fib_table_delete(struct net *net, struct fib_table *tb,
 		     fi->fib_prefsrc == cfg->fc_prefsrc) &&
 		    (!cfg->fc_protocol ||
 		     fi->fib_protocol == cfg->fc_protocol) &&
-		    fib_nh_match(cfg, fi) == 0) {
-			fa_to_delete = fa;
+		    fib_nh_match(cfg, fi) == 0 &&
+		    fib_metrics_match(cfg, fi)) {
 			break;
 		}
 	}

@@ -3582,7 +3582,7 @@ static void __sched notrace __schedule(bool preempt)
 		hrtick_clear(rq);
 
 	local_irq_disable();
-	rcu_note_context_switch();
+	rcu_note_context_switch(preempt);
 
 	/*
 	 * Make sure that signal_pending_state()->signal_pending() below
@@ -7975,7 +7975,7 @@ static void cpuset_cpu_active(void)
 		 */
 		cpuset_force_rebuild();
 	}
-	cpuset_update_active_cpus(true);
+	cpuset_update_active_cpus();
 }
 
 static int cpuset_cpu_inactive(unsigned int cpu)
@@ -7998,7 +7998,7 @@ static int cpuset_cpu_inactive(unsigned int cpu)
 
 		if (overflow)
 			return -EBUSY;
-		cpuset_update_active_cpus(false);
+		cpuset_update_active_cpus();
 	} else {
 		num_cpus_frozen++;
 		partition_sched_domains(1, NULL, NULL);
@@ -8060,9 +8060,6 @@ int sched_cpu_deactivate(unsigned int cpu)
 	 * We've cleared cpu_active_mask, wait for all preempt-disabled and RCU
 	 * users of this state to go away such that all new such users will
 	 * observe it.
-	 *
-	 * For CONFIG_PREEMPT we have preemptible RCU and its sync_rcu() might
-	 * not imply sync_sched(), so wait for both.
 	 *
 	 * Do sync before park smpboot threads to take care the rcu boost case.
 	 */
@@ -8489,6 +8486,34 @@ void ___might_sleep(const char *file, int line, int preempt_offset)
 	add_taint(TAINT_WARN, LOCKDEP_STILL_OK);
 }
 EXPORT_SYMBOL(___might_sleep);
+
+void __cant_sleep(const char *file, int line, int preempt_offset)
+{
+	static unsigned long prev_jiffy;
+
+	if (irqs_disabled())
+		return;
+
+	if (!IS_ENABLED(CONFIG_PREEMPT_COUNT))
+		return;
+
+	if (preempt_count() > preempt_offset)
+		return;
+
+	if (time_before(jiffies, prev_jiffy + HZ) && prev_jiffy)
+		return;
+	prev_jiffy = jiffies;
+
+	printk(KERN_ERR "BUG: assuming atomic context at %s:%d\n", file, line);
+	printk(KERN_ERR "in_atomic(): %d, irqs_disabled(): %d, pid: %d, name: %s\n",
+			in_atomic(), irqs_disabled(),
+			current->pid, current->comm);
+
+	debug_show_held_locks(current);
+	dump_stack();
+	add_taint(TAINT_WARN, LOCKDEP_STILL_OK);
+}
+EXPORT_SYMBOL_GPL(__cant_sleep);
 #endif
 
 #ifdef CONFIG_MAGIC_SYSRQ

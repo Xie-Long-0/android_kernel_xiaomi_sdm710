@@ -17,11 +17,7 @@
 # define __release(x)	__context__(x,-1)
 # define __cond_lock(x,c)	((c) ? ({ __acquire(x); 1; }) : 0)
 # define __percpu	__attribute__((noderef, address_space(3)))
-#ifdef CONFIG_SPARSE_RCU_POINTER
 # define __rcu		__attribute__((noderef, address_space(4)))
-#else /* CONFIG_SPARSE_RCU_POINTER */
-# define __rcu
-#endif /* CONFIG_SPARSE_RCU_POINTER */
 # define __private	__attribute__((noderef))
 extern void __chk_user_ptr(const volatile void __user *);
 extern void __chk_io_ptr(const volatile void __iomem *);
@@ -458,6 +454,10 @@ unsigned long read_word_at_a_time(const void *addr)
 # define __attribute_const__	/* unimplemented */
 #endif
 
+#ifndef __designated_init
+# define __designated_init
+#endif
+
 #ifndef __latent_entropy
 # define __latent_entropy
 #endif
@@ -494,7 +494,6 @@ unsigned long read_word_at_a_time(const void *addr)
 #ifndef __assume_aligned
 #define __assume_aligned(a, ...)
 #endif
-
 
 /* Are two types/vars the same type (ignoring qualifiers)? */
 #ifndef __same_type

@@ -2220,7 +2220,7 @@ static void __init gather_bootmem_prealloc(void)
 		prep_new_huge_page(h, page, page_to_nid(page));
 		/*
 		 * If we had gigantic hugepages allocated at boot time, we need
-		 * to restore the 'stolen' pages to totalram_pages in order to
+		 * to restore the 'stolen' pages to totalram_pages() in order to
 		 * fix confusing memory reports from free(1) and another
 		 * side-effects, like CommitLimit going negative.
 		 */
@@ -3220,7 +3220,7 @@ static int hugetlb_vm_op_split(struct vm_area_struct *vma, unsigned long addr)
  * hugegpage VMA.  do_page_fault() is supposed to trap this, so BUG is we get
  * this far.
  */
-static int hugetlb_vm_op_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+static vm_fault_t hugetlb_vm_op_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
 	BUG();
 	return 0;

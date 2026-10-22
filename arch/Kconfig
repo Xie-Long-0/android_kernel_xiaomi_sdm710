@@ -190,6 +190,9 @@ config HAVE_OPTPROBES
 config HAVE_KPROBES_ON_FTRACE
 	bool
 
+config HAVE_FUNCTION_ERROR_INJECTION
+	bool
+
 config HAVE_NMI
 	bool
 
@@ -226,6 +229,9 @@ config ARCH_HAS_FORTIFY_SOURCE
 	help
 	  An architecture should select this when it can successfully
 	  build and run with CONFIG_FORTIFY_SOURCE.
+
+config ARCH_HAS_SET_MEMORY
+	bool
 
 config FORTIFY_COMPILE_CHECK
 	depends on ARCH_HAS_FORTIFY_SOURCE
@@ -327,6 +333,9 @@ config HAVE_CMPXCHG_LOCAL
 	bool
 
 config HAVE_CMPXCHG_DOUBLE
+	bool
+
+config ARCH_WEAK_RELEASE_ACQUIRE
 	bool
 
 config ARCH_WANT_IPC_PARSE_VERSION
@@ -854,5 +863,40 @@ config VMAP_STACK
 	  This is presently incompatible with KASAN because KASAN expects
 	  the stack to map directly to the KASAN shadow map using a formula
 	  that is incorrect if the stack is in vmalloc space.
+
+# Select if the architecture has support for applying RELR relocations.
+config ARCH_HAS_RELR
+	bool
+
+config RELR
+	bool "Use RELR relocation packing"
+	depends on ARCH_HAS_RELR && TOOLS_SUPPORT_RELR
+	default y
+	help
+	  Store the kernel's dynamic relocations in the RELR relocation packing
+	  format. Requires a compatible linker (LLD supports this feature), as
+	  well as compatible NM and OBJCOPY utilities (llvm-nm and llvm-objcopy
+	  are compatible).
+
+config ARCH_HAS_REFCOUNT
+	bool
+	help
+	  An architecture selects this when it has implemented refcount_t
+	  using open coded assembly primitives that provide an optimized
+	  refcount_t implementation, possibly at the expense of some full
+	  refcount state checks of CONFIG_REFCOUNT_FULL=y.
+
+	  The refcount overflow check behavior, however, must be retained.
+	  Catching overflows is the primary security concern for protecting
+	  against bugs in reference counts.
+
+config REFCOUNT_FULL
+	bool "Perform full reference count validation at the expense of speed"
+	help
+	  Enabling this switches the refcounting infrastructure from a fast
+	  unchecked atomic_t implementation to a fully state checked
+	  implementation, which can be (slightly) slower but provides protections
+	  against various use-after-free conditions that can be used in
+	  security flaw exploits.
 
 source "kernel/gcov/Kconfig"

@@ -187,6 +187,7 @@ config NET_IPGRE_DEMUX
 config NET_IP_TUNNEL
 	tristate
 	select DST_CACHE
+	select GRO_CELLS
 	default n
 
 config NET_IPGRE
@@ -371,16 +372,6 @@ config INET_IPCOMP
 
 	  If unsure, say Y.
 
-config INET_TABLE_PERTURB_ORDER
-	int "INET: Source port perturbation table size (as power of 2)" if EXPERT
-	default 16
-	help
-	  Source port perturbation table size (as power of 2) for
-	  RFC 6056 3.3.4.  Algorithm 4: Double-Hash Port Selection Algorithm.
-
-	  The default is almost always what you want.
-	  Only change this if you know what you are doing.
-
 config INET_XFRM_TUNNEL
 	tristate
 	select INET_TUNNEL
@@ -439,6 +430,14 @@ config INET_UDP_DIAG
 	default n
 	---help---
 	  Support for UDP socket monitoring interface used by the ss tool.
+	  If unsure, say Y.
+
+config INET_RAW_DIAG
+	tristate "RAW: socket monitoring interface"
+	depends on INET_DIAG && (IPV6 || IPV6=n)
+	default n
+	---help---
+	  Support for RAW socket monitoring interface used by the ss tool.
 	  If unsure, say Y.
 
 config INET_DIAG_DESTROY

@@ -172,8 +172,20 @@ extern struct trace_event_functions exit_syscall_print_funcs;
 	static struct syscall_metadata __used			\
 	  __attribute__((section("__syscalls_metadata")))	\
 	 *__p_syscall_meta_##sname = &__syscall_meta_##sname;
+
+static inline int is_syscall_trace_event(struct trace_event_call *tp_event)
+{
+	return tp_event->class == &event_class_syscall_enter ||
+	       tp_event->class == &event_class_syscall_exit;
+}
+
 #else
 #define SYSCALL_METADATA(sname, nb, ...)
+
+static inline int is_syscall_trace_event(struct trace_event_call *tp_event)
+{
+	return 0;
+}
 #endif
 
 #define SYSCALL_DEFINE0(sname)					\
@@ -186,6 +198,8 @@ extern struct trace_event_functions exit_syscall_print_funcs;
 #define SYSCALL_DEFINE4(name, ...) SYSCALL_DEFINEx(4, _##name, __VA_ARGS__)
 #define SYSCALL_DEFINE5(name, ...) SYSCALL_DEFINEx(5, _##name, __VA_ARGS__)
 #define SYSCALL_DEFINE6(name, ...) SYSCALL_DEFINEx(6, _##name, __VA_ARGS__)
+
+#define SYSCALL_DEFINE_MAXARGS	6
 
 #define SYSCALL_DEFINEx(x, sname, ...)				\
 	SYSCALL_METADATA(sname, x, __VA_ARGS__)			\
@@ -538,6 +552,8 @@ asmlinkage long sys_creat(const char __user *pathname, umode_t mode);
 asmlinkage long sys_open(const char __user *filename,
 				int flags, umode_t mode);
 asmlinkage long sys_close(unsigned int fd);
+asmlinkage long sys_close_range(unsigned int fd, unsigned int max_fd,
+				unsigned int flags);
 asmlinkage long sys_access(const char __user *filename, int mode);
 asmlinkage long sys_vhangup(void);
 asmlinkage long sys_chown(const char __user *filename,
@@ -661,6 +677,11 @@ asmlinkage long sys_epoll_pwait(int epfd, struct epoll_event __user *events,
 				int maxevents, int timeout,
 				const sigset_t __user *sigmask,
 				size_t sigsetsize);
+asmlinkage long sys_epoll_pwait2(int epfd, struct epoll_event __user *events,
+				 int maxevents,
+				 const struct __kernel_timespec __user *timeout,
+				 const sigset_t __user *sigmask,
+				 size_t sigsetsize);
 asmlinkage long sys_gethostname(char __user *name, int len);
 asmlinkage long sys_sethostname(char __user *name, int len);
 asmlinkage long sys_setdomainname(char __user *name, int len);

@@ -966,7 +966,7 @@ int mem_cgroup_scan_tasks(struct mem_cgroup *memcg,
 		struct css_task_iter it;
 		struct task_struct *task;
 
-		css_task_iter_start(&iter->css, &it);
+		css_task_iter_start(&iter->css, 0, &it);
 		while (!ret && (task = css_task_iter_next(&it)))
 			ret = fn(task, arg);
 		css_task_iter_end(&it);
@@ -5760,6 +5760,10 @@ void mem_cgroup_sk_alloc(struct sock *sk)
 		css_get(&sk->sk_memcg->css);
 		return;
 	}
+
+	/* Do not associate the sock with unrelated interrupted task's memcg. */
+	if (in_interrupt())
+		return;
 
 	/* Do not associate the sock with unrelated interrupted task's memcg. */
 	if (in_interrupt())

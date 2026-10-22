@@ -46,6 +46,7 @@
 #include <net/dcbnl.h>
 #endif
 #include <net/netprio_cgroup.h>
+#include <net/xdp.h>
 
 #include <linux/netdev_features.h>
 #include <linux/neighbour.h>
@@ -65,6 +66,7 @@ struct mpls_dev;
 /* UDP Tunnel offloads */
 struct udp_tunnel_info;
 struct bpf_prog;
+struct xdp_buff;
 
 void netdev_set_default_ethtool_ops(struct net_device *dev,
 				    const struct ethtool_ops *ops);
@@ -257,9 +259,11 @@ struct hh_cache {
  * relationship HH alignment <= LL alignment.
  */
 #define LL_RESERVED_SPACE(dev) \
-	((((dev)->hard_header_len+(dev)->needed_headroom)&~(HH_DATA_MOD - 1)) + HH_DATA_MOD)
+	((((dev)->hard_header_len + READ_ONCE((dev)->needed_headroom)) \
+	  & ~(HH_DATA_MOD - 1)) + HH_DATA_MOD)
 #define LL_RESERVED_SPACE_EXTRA(dev,extra) \
-	((((dev)->hard_header_len+(dev)->needed_headroom+(extra))&~(HH_DATA_MOD - 1)) + HH_DATA_MOD)
+	((((dev)->hard_header_len + READ_ONCE((dev)->needed_headroom) + (extra)) \
+	  & ~(HH_DATA_MOD - 1)) + HH_DATA_MOD)
 
 struct header_ops {
 	int	(*create) (struct sk_buff *skb, struct net_device *dev,
@@ -697,6 +701,7 @@ struct netdev_rx_queue {
 #endif
 	struct kobject			kobj;
 	struct net_device		*dev;
+	struct xdp_rxq_info		xdp_rxq;
 } ____cacheline_aligned_in_smp;
 
 /*
@@ -805,10 +810,10 @@ struct tc_to_netdev {
 	};
 };
 
-/* These structures hold the attributes of xdp state that are being passed
- * to the netdevice through the xdp op.
+/* These structures hold the attributes of bpf state that are being passed
+ * to the netdevice through the bpf op.
  */
-enum xdp_netdev_command {
+enum bpf_netdev_command {
 	/* Set or clear a bpf program used in the earliest stages of packet
 	 * rx. The prog will have been loaded as BPF_PROG_TYPE_XDP. The callee
 	 * is responsible for calling bpf_prog_put on any old progs that are
@@ -817,19 +822,42 @@ enum xdp_netdev_command {
 	 * when it is no longer used.
 	 */
 	XDP_SETUP_PROG,
-	/* Check if a bpf program is set on the device.  The callee should
-	 * return true if a program is currently attached and running.
-	 */
+	XDP_SETUP_PROG_HW,
 	XDP_QUERY_PROG,
+	XDP_QUERY_PROG_HW,
+	/* BPF program for offload callbacks, invoked at program load time. */
+	BPF_OFFLOAD_MAP_ALLOC,
+	BPF_OFFLOAD_MAP_FREE,
+	XDP_QUERY_XSK_UMEM,
+	XDP_SETUP_XSK_UMEM,
 };
 
-struct netdev_xdp {
-	enum xdp_netdev_command command;
+struct bpf_prog_offload_ops;
+struct xdp_umem;
+
+struct netdev_bpf {
+	enum bpf_netdev_command command;
 	union {
 		/* XDP_SETUP_PROG */
-		struct bpf_prog *prog;
-		/* XDP_QUERY_PROG */
-		bool prog_attached;
+		struct {
+			u32 flags;
+			struct bpf_prog *prog;
+		};
+		/* XDP_QUERY_PROG, XDP_QUERY_PROG_HW */
+		struct {
+			u32 prog_id;
+			/* flags with which program was installed */
+			u32 prog_flags;
+		};
+		/* BPF_OFFLOAD_MAP_ALLOC, BPF_OFFLOAD_MAP_FREE */
+		struct {
+			struct bpf_offloaded_map *offmap;
+		};
+		/* XDP_QUERY_XSK_UMEM, XDP_SETUP_XSK_UMEM */
+		struct {
+			struct xdp_umem *umem; /* out for query*/
+			u16 queue_id; /* in for query */
+		} xsk;
 	};
 };
 
@@ -1130,10 +1158,20 @@ struct netdev_xdp {
  *	appropriate rx headroom value allows avoiding skb head copy on
  *	forward. Setting a negative value resets the rx headroom to the
  *	default value.
- * int (*ndo_xdp)(struct net_device *dev, struct netdev_xdp *xdp);
+ * int (*ndo_bpf)(struct net_device *dev, struct netdev_bpf *bpf);
  *	This function is used to set or query state related to XDP on the
- *	netdevice. See definition of enum xdp_netdev_command for details.
- *
+ *	netdevice and manage BPF offload. See definition of
+ *	enum bpf_netdev_command for details.
+ * int (*ndo_xdp_xmit)(struct net_device *dev, int n, struct xdp_frame **xdp,
+ *			u32 flags);
+ *	This function is used to submit @n XDP packets for transmit on a
+ *	netdevice. Returns number of frames successfully transmitted, frames
+ *	that got dropped are freed/returned via xdp_return_frame().
+ *	Returns negative number, means general error invoking ndo, meaning
+ *	no frames were xmit'ed and core-caller will free all frames.
+ * void (*ndo_xdp_flush)(struct net_device *dev);
+ *	This function is used to inform the driver to flush a particular
+ *	xdp tx queue. Must be called on same CPU as xdp_xmit.
  */
 struct net_device_ops {
 	int			(*ndo_init)(struct net_device *dev);
@@ -1322,8 +1360,12 @@ struct net_device_ops {
 						       struct sk_buff *skb);
 	void			(*ndo_set_rx_headroom)(struct net_device *dev,
 						       int needed_headroom);
-	int			(*ndo_xdp)(struct net_device *dev,
-					   struct netdev_xdp *xdp);
+	int			(*ndo_bpf)(struct net_device *dev,
+					   struct netdev_bpf *bpf);
+	int			(*ndo_xdp_xmit)(struct net_device *dev, int n,
+						struct xdp_frame **xdp,
+						u32 flags);
+	void			(*ndo_xdp_flush)(struct net_device *dev);
 };
 
 /**
@@ -1801,6 +1843,7 @@ struct net_device {
 	unsigned int		real_num_rx_queues;
 #endif
 
+	struct bpf_prog __rcu	*xdp_prog;
 	unsigned long		gro_flush_timeout;
 	rx_handler_func_t __rcu	*rx_handler;
 	void __rcu		*rx_handler_data;
@@ -1914,6 +1957,13 @@ struct net_device {
 	bool			proto_down;
 };
 #define to_net_dev(d) container_of(d, struct net_device, dev)
+
+static inline bool netif_elide_gro(const struct net_device *dev)
+{
+	if (!(dev->features & NETIF_F_GRO) || dev->xdp_prog)
+		return true;
+	return false;
+}
 
 #define	NETDEV_ALIGN		32
 
@@ -2489,6 +2539,7 @@ static inline int dev_recursion_level(void)
 struct net_device *dev_get_by_index(struct net *net, int ifindex);
 struct net_device *__dev_get_by_index(struct net *net, int ifindex);
 struct net_device *dev_get_by_index_rcu(struct net *net, int ifindex);
+struct net_device *dev_get_by_napi_id(unsigned int napi_id);
 int netdev_get_name(struct net *net, char *name, int ifindex);
 int dev_restart(struct net_device *dev);
 int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb);
@@ -3268,6 +3319,12 @@ static inline int netif_set_real_num_rx_queues(struct net_device *dev,
 }
 #endif
 
+static inline struct netdev_rx_queue *
+__netif_get_rx_queue(struct net_device *dev, unsigned int rxq)
+{
+	return dev->_rx + rxq;
+}
+
 #ifdef CONFIG_SYSFS
 static inline unsigned int get_netdev_rx_queue_index(
 		struct netdev_rx_queue *queue)
@@ -3330,9 +3387,12 @@ static inline void dev_consume_skb_any(struct sk_buff *skb)
 	__dev_kfree_skb_any(skb, SKB_REASON_CONSUMED);
 }
 
+void generic_xdp_tx(struct sk_buff *skb, struct bpf_prog *xdp_prog);
+int do_xdp_generic(struct bpf_prog *xdp_prog, struct sk_buff *skb);
 int netif_rx(struct sk_buff *skb);
 int netif_rx_ni(struct sk_buff *skb);
 int netif_receive_skb(struct sk_buff *skb);
+int netif_receive_skb_core(struct sk_buff *skb);
 gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb);
 void napi_gro_flush(struct napi_struct *napi, bool flush_old);
 struct sk_buff *napi_get_frags(struct napi_struct *napi);
@@ -3373,14 +3433,21 @@ int dev_get_phys_port_id(struct net_device *dev,
 int dev_get_phys_port_name(struct net_device *dev,
 			   char *name, size_t len);
 int dev_change_proto_down(struct net_device *dev, bool proto_down);
-int dev_change_xdp_fd(struct net_device *dev, int fd);
 struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *dev);
 struct sk_buff *dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
 				    struct netdev_queue *txq, int *ret);
+
+typedef int (*bpf_op_t)(struct net_device *dev, struct netdev_bpf *bpf);
+int dev_change_xdp_fd(struct net_device *dev, int fd, u32 flags);
+u32 __dev_xdp_query(struct net_device *dev, bpf_op_t xdp_op,
+		     enum bpf_netdev_command cmd);
+int xdp_umem_query(struct net_device *dev, u16 queue_id);
+
 struct sk_buff *dev_hard_start_xmit_list(struct sk_buff *skb,
 				struct net_device *dev,
 				struct netdev_queue *txq,
 				int *ret);
+
 int __dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
 int dev_forward_skb(struct net_device *dev, struct sk_buff *skb);
 bool is_skb_forwardable(const struct net_device *dev,
@@ -4291,6 +4358,11 @@ static inline bool netif_is_bridge_port(const struct net_device *dev)
 static inline bool netif_is_ovs_master(const struct net_device *dev)
 {
 	return dev->priv_flags & IFF_OPENVSWITCH;
+}
+
+static inline bool netif_is_ovs_port(const struct net_device *dev)
+{
+	return dev->priv_flags & IFF_OVS_DATAPATH;
 }
 
 static inline bool netif_is_team_master(const struct net_device *dev)

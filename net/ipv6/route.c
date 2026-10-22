@@ -1745,6 +1745,7 @@ out:
 static int ip6_convert_metrics(struct mx6_config *mxc,
 			       const struct fib6_config *cfg)
 {
+	struct net *net = cfg->fc_nlinfo.nl_net;
 	bool ecn_ca = false;
 	struct nlattr *nla;
 	int remaining;
@@ -1770,7 +1771,7 @@ static int ip6_convert_metrics(struct mx6_config *mxc,
 			char tmp[TCP_CA_NAME_MAX];
 
 			nla_strlcpy(tmp, nla, sizeof(tmp));
-			val = tcp_ca_get_key_by_name(tmp, &ecn_ca);
+			val = tcp_ca_get_key_by_name(net, tmp, &ecn_ca);
 			if (val == TCP_CA_UNSPEC)
 				goto err;
 		} else {
@@ -2291,6 +2292,7 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
 	if (on_link)
 		nrt->rt6i_flags &= ~RTF_GATEWAY;
 
+	nrt->rt6i_protocol = RTPROT_REDIRECT;
 	nrt->rt6i_gateway = *(struct in6_addr *)neigh->primary_key;
 
 	if (ip6_ins_rt(nrt))
@@ -2391,6 +2393,7 @@ static struct rt6_info *rt6_add_route_info(struct net_device *dev,
 		.fc_dst_len	= prefixlen,
 		.fc_flags	= RTF_GATEWAY | RTF_ADDRCONF | RTF_ROUTEINFO |
 				  RTF_UP | RTF_PREF(pref),
+		.fc_protocol = RTPROT_RA,
 		.fc_nlinfo.portid = 0,
 		.fc_nlinfo.nlh = NULL,
 		.fc_nlinfo.nl_net = dev_net(dev),
@@ -2443,6 +2446,7 @@ struct rt6_info *rt6_add_dflt_router(const struct in6_addr *gwaddr,
 		.fc_ifindex	= dev->ifindex,
 		.fc_flags	= RTF_GATEWAY | RTF_ADDRCONF | RTF_DEFAULT |
 				  RTF_UP | RTF_EXPIRES | RTF_PREF(pref),
+		.fc_protocol = RTPROT_RA,
 		.fc_nlinfo.portid = 0,
 		.fc_nlinfo.nlh = NULL,
 		.fc_nlinfo.nl_net = dev_net(dev),
@@ -3204,6 +3208,8 @@ static int rt6_fill_node(struct net *net,
 	}
 	else if (rt->rt6i_flags & RTF_LOCAL)
 		rtm->rtm_type = RTN_LOCAL;
+	else if (rt->rt6i_flags & RTF_ANYCAST)
+		rtm->rtm_type = RTN_ANYCAST;
 	else if (rt->dst.dev && (rt->dst.dev->flags & IFF_LOOPBACK))
 		rtm->rtm_type = RTN_LOCAL;
 	else
@@ -3216,14 +3222,6 @@ static int rt6_fill_node(struct net *net,
 	}
 	rtm->rtm_scope = RT_SCOPE_UNIVERSE;
 	rtm->rtm_protocol = rt->rt6i_protocol;
-	if (rt->rt6i_flags & RTF_DYNAMIC)
-		rtm->rtm_protocol = RTPROT_REDIRECT;
-	else if (rt->rt6i_flags & RTF_ADDRCONF) {
-		if (rt->rt6i_flags & (RTF_DEFAULT | RTF_ROUTEINFO))
-			rtm->rtm_protocol = RTPROT_RA;
-		else
-			rtm->rtm_protocol = RTPROT_KERNEL;
-	}
 
 	if (rt->rt6i_flags & RTF_CACHE)
 		rtm->rtm_flags |= RTM_F_CLONED;
@@ -3484,10 +3482,10 @@ static int ip6_route_dev_notify(struct notifier_block *this,
 		/* NETDEV_UNREGISTER could be fired for multiple times by
 		 * netdev_wait_allrefs(). Make sure we only call this once.
 		 */
-		in6_dev_put(net->ipv6.ip6_null_entry->rt6i_idev);
+		in6_dev_put_clear(&net->ipv6.ip6_null_entry->rt6i_idev);
 #ifdef CONFIG_IPV6_MULTIPLE_TABLES
-		in6_dev_put(net->ipv6.ip6_prohibit_entry->rt6i_idev);
-		in6_dev_put(net->ipv6.ip6_blk_hole_entry->rt6i_idev);
+		in6_dev_put_clear(&net->ipv6.ip6_prohibit_entry->rt6i_idev);
+		in6_dev_put_clear(&net->ipv6.ip6_blk_hole_entry->rt6i_idev);
 #endif
 	}
 

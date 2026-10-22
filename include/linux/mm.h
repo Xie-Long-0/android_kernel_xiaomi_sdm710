@@ -23,6 +23,7 @@
 #include <linux/page_ext.h>
 #include <linux/err.h>
 #include <linux/page_ref.h>
+#include <linux/overflow.h>
 
 struct mempolicy;
 struct anon_vma;
@@ -31,6 +32,28 @@ struct file_ra_state;
 struct user_struct;
 struct writeback_control;
 struct bdi_writeback;
+
+/**
+ * mmgrab() - Pin a &struct mm_struct.
+ * @mm: The &struct mm_struct to pin.
+ *
+ * Make sure that @mm will not get freed even after the owning task
+ * exits. This doesn't guarantee that the associated address space
+ * will still exist later on and mmget_not_zero() has to be used before
+ * accessing it.
+ *
+ * This is a preferred way to pin @mm for a longer/unbounded amount
+ * of time.
+ *
+ * Use mmdrop() to release the reference acquired by mmgrab().
+ *
+ * See also <Documentation/vm/active_mm.rst> for an in-depth explanation
+ * of &mm_struct.mm_count vs &mm_struct.mm_users.
+ */
+static inline void mmgrab(struct mm_struct *mm)
+{
+	atomic_inc(&mm->mm_count);
+}
 
 #ifndef CONFIG_NEED_MULTIPLE_NODES	/* Don't use mapnrs, do it properly */
 extern unsigned long max_mapnr;
@@ -43,7 +66,32 @@ static inline void set_max_mapnr(unsigned long limit)
 static inline void set_max_mapnr(unsigned long limit) { }
 #endif
 
-extern unsigned long totalram_pages;
+extern atomic_long_t _totalram_pages;
+static inline unsigned long totalram_pages(void)
+{
+	return (unsigned long)atomic_long_read(&_totalram_pages);
+}
+
+static inline void totalram_pages_inc(void)
+{
+	atomic_long_inc(&_totalram_pages);
+}
+
+static inline void totalram_pages_dec(void)
+{
+	atomic_long_dec(&_totalram_pages);
+}
+
+static inline void totalram_pages_add(long count)
+{
+	atomic_long_add(count, &_totalram_pages);
+}
+
+static inline void totalram_pages_set(long val)
+{
+	atomic_long_set(&_totalram_pages, val);
+}
+
 extern void * high_memory;
 extern int page_cluster;
 
@@ -187,7 +235,7 @@ extern unsigned int kobjsize(const void *objp);
 #define VM_NORESERVE	0x00200000	/* should the VM suppress accounting */
 #define VM_HUGETLB	0x00400000	/* Huge TLB Page VM */
 #define VM_ARCH_1	0x01000000	/* Architecture-specific flag */
-#define VM_ARCH_2	0x02000000
+#define VM_WIPEONFORK	0x02000000	/* Wipe VMA contents in child. */
 #define VM_DONTDUMP	0x04000000	/* Do not include in the core dump */
 
 #ifdef CONFIG_MEM_SOFT_DIRTY
@@ -372,18 +420,18 @@ struct vm_operations_struct {
 	void (*close)(struct vm_area_struct * area);
 	int (*split)(struct vm_area_struct * area, unsigned long addr);
 	int (*mremap)(struct vm_area_struct * area);
-	int (*fault)(struct vm_area_struct *vma, struct vm_fault *vmf);
-	int (*pmd_fault)(struct vm_area_struct *, unsigned long address,
+	vm_fault_t (*fault)(struct vm_area_struct *vma, struct vm_fault *vmf);
+	vm_fault_t (*pmd_fault)(struct vm_area_struct *, unsigned long address,
 						pmd_t *, unsigned int flags);
 	void (*map_pages)(struct fault_env *fe,
 			pgoff_t start_pgoff, pgoff_t end_pgoff);
 
 	/* notification that a previously read-only page is about to become
 	 * writable, if an error is returned it will cause a SIGBUS */
-	int (*page_mkwrite)(struct vm_area_struct *vma, struct vm_fault *vmf);
+	vm_fault_t (*page_mkwrite)(struct vm_area_struct *vma, struct vm_fault *vmf);
 
 	/* same as page_mkwrite when using VM_PFNMAP|VM_MIXEDMAP */
-	int (*pfn_mkwrite)(struct vm_area_struct *vma, struct vm_fault *vmf);
+	vm_fault_t (*pfn_mkwrite)(struct vm_area_struct *vma, struct vm_fault *vmf);
 
 	/* called by access_process_vm when get_user_pages() fails, typically
 	 * for use by special VMAs that can switch between memory and hardware
@@ -502,16 +550,16 @@ unsigned long vmalloc_to_pfn(const void *addr);
  * On nommu, vmalloc/vfree wrap through kmalloc/kfree directly, so there
  * is no special casing required.
  */
-
-#ifdef CONFIG_MMU
-extern int is_vmalloc_addr(const void *x);
-#else
-static inline int is_vmalloc_addr(const void *x)
+static inline bool is_vmalloc_addr(const void *x)
 {
-	return 0;
-}
-#endif
+#ifdef CONFIG_MMU
+	unsigned long addr = (unsigned long)x;
 
+	return addr >= VMALLOC_START && addr < VMALLOC_END;
+#else
+	return false;
+#endif
+}
 #ifdef CONFIG_MMU
 extern int is_vmalloc_or_module_addr(const void *x);
 #else
@@ -520,6 +568,35 @@ static inline int is_vmalloc_or_module_addr(const void *x)
 	return 0;
 }
 #endif
+
+extern void *kvmalloc_node(size_t size, gfp_t flags, int node);
+static inline void *kvmalloc(size_t size, gfp_t flags)
+{
+	return kvmalloc_node(size, flags, NUMA_NO_NODE);
+}
+static inline void *kvzalloc_node(size_t size, gfp_t flags, int node)
+{
+	return kvmalloc_node(size, flags | __GFP_ZERO, node);
+}
+static inline void *kvzalloc(size_t size, gfp_t flags)
+{
+	return kvmalloc(size, flags | __GFP_ZERO);
+}
+
+static inline void *kvmalloc_array(size_t n, size_t size, gfp_t flags)
+{
+	size_t bytes;
+
+	if (unlikely(check_mul_overflow(n, size, &bytes)))
+		return NULL;
+
+	return kvmalloc(bytes, flags);
+}
+
+static inline void *kvcalloc(size_t n, size_t size, gfp_t flags)
+{
+	return kvmalloc_array(n, size, flags | __GFP_ZERO);
+}
 
 extern void kvfree(const void *addr);
 
@@ -2399,6 +2476,44 @@ int vm_insert_mixed(struct vm_area_struct *vma, unsigned long addr,
 			pfn_t pfn);
 int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long len);
 
+static inline vm_fault_t vmf_insert_page(struct vm_area_struct *vma,
+				unsigned long addr, struct page *page)
+{
+	int err = vm_insert_page(vma, addr, page);
+
+	if (err == -ENOMEM)
+		return VM_FAULT_OOM;
+	if (err < 0 && err != -EBUSY)
+		return VM_FAULT_SIGBUS;
+
+	return VM_FAULT_NOPAGE;
+}
+
+static inline vm_fault_t vmf_insert_mixed(struct vm_area_struct *vma,
+				unsigned long addr, pfn_t pfn)
+{
+	int err = vm_insert_mixed(vma, addr, pfn);
+
+	if (err == -ENOMEM)
+		return VM_FAULT_OOM;
+	if (err < 0 && err != -EBUSY)
+		return VM_FAULT_SIGBUS;
+
+	return VM_FAULT_NOPAGE;
+}
+
+static inline vm_fault_t vmf_insert_pfn(struct vm_area_struct *vma,
+			unsigned long addr, unsigned long pfn)
+{
+	int err = vm_insert_pfn(vma, addr, pfn);
+
+	if (err == -ENOMEM)
+		return VM_FAULT_OOM;
+	if (err < 0 && err != -EBUSY)
+		return VM_FAULT_SIGBUS;
+
+	return VM_FAULT_NOPAGE;
+}
 
 struct page *follow_page_mask(struct vm_area_struct *vma,
 			      unsigned long address, unsigned int foll_flags,

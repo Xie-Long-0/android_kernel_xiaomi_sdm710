@@ -46,6 +46,8 @@
 #include <linux/filter.h>
 #include <linux/namei.h>
 #include <linux/parser.h>
+#include <linux/proc_ns.h>
+#include <linux/mount.h>
 
 #include "internal.h"
 
@@ -409,9 +411,12 @@ static DEFINE_PER_CPU(bool, is_hotplugging);
 
 static atomic_t nr_mmap_events __read_mostly;
 static atomic_t nr_comm_events __read_mostly;
+static atomic_t nr_namespaces_events __read_mostly;
 static atomic_t nr_task_events __read_mostly;
 static atomic_t nr_freq_events __read_mostly;
 static atomic_t nr_switch_events __read_mostly;
+static atomic_t nr_ksymbol_events __read_mostly;
+static atomic_t nr_bpf_events __read_mostly;
 
 static LIST_HEAD(pmus);
 static DEFINE_MUTEX(pmus_lock);
@@ -3687,10 +3692,12 @@ static inline u64 perf_event_count(struct perf_event *event)
  *     will not be local and we cannot read them atomically
  *   - must not have a pmu::count method
  */
-u64 perf_event_read_local(struct perf_event *event)
+int perf_event_read_local(struct perf_event *event, u64 *value,
+			  u64 *enabled, u64 *running)
 {
 	unsigned long flags;
-	u64 val;
+	int ret = 0;
+	u64 now;
 
 	/*
 	 * Disabling interrupts avoids all counter scheduling (context
@@ -3698,38 +3705,65 @@ u64 perf_event_read_local(struct perf_event *event)
 	 */
 	local_irq_save(flags);
 
-	/* If this is a per-task event, it must be for current */
-	WARN_ON_ONCE((event->attach_state & PERF_ATTACH_TASK) &&
-		     event->hw.target != current);
-
-	/* If this is a per-CPU event, it must be for this CPU */
-	WARN_ON_ONCE(!(event->attach_state & PERF_ATTACH_TASK) &&
-		     event->cpu != smp_processor_id());
-
 	/*
 	 * It must not be an event with inherit set, we cannot read
 	 * all child counters from atomic context.
 	 */
-	WARN_ON_ONCE(event->attr.inherit);
+	if (event->attr.inherit) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
 
 	/*
 	 * It must not have a pmu::count method, those are not
 	 * NMI safe.
 	 */
-	WARN_ON_ONCE(event->pmu->count);
+	if (event->pmu->count) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
 
+	/* If this is a per-task event, it must be for current */
+	if ((event->attach_state & PERF_ATTACH_TASK) &&
+	    event->hw.target != current) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* If this is a per-CPU event, it must be for this CPU */
+	if (!(event->attach_state & PERF_ATTACH_TASK) &&
+	    event->cpu != smp_processor_id()) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* If this is a pinned event it must be running on this CPU */
+	if (event->attr.pinned && event->oncpu != smp_processor_id()) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	now = event->shadow_ctx_time + perf_clock();
+	if (enabled)
+		*enabled = now - event->tstamp_enabled;
 	/*
 	 * If the event is currently on this CPU, its either a per-task event,
 	 * or local to this CPU. Furthermore it means its ACTIVE (otherwise
 	 * oncpu == -1).
 	 */
-	if (event->oncpu == smp_processor_id())
+	if (event->oncpu == smp_processor_id()) {
 		event->pmu->read(event);
+		if (running)
+			*running = now - event->tstamp_running;
+	} else if (running) {
+		*running = event->total_time_running;
+	}
 
-	val = local64_read(&event->count);
+	*value = local64_read(&event->count);
+out:
 	local_irq_restore(flags);
 
-	return val;
+	return ret;
 }
 
 static int perf_event_read(struct perf_event *event, bool group)
@@ -4005,7 +4039,7 @@ static bool is_sb_event(struct perf_event *event)
 
 	if (attr->mmap || attr->mmap_data || attr->mmap2 ||
 	    attr->comm || attr->comm_exec ||
-	    attr->task ||
+	    attr->task || attr->ksymbol ||
 	    attr->context_switch)
 		return true;
 	return false;
@@ -4061,6 +4095,8 @@ static void unaccount_event(struct perf_event *event)
 		atomic_dec(&nr_mmap_events);
 	if (event->attr.comm)
 		atomic_dec(&nr_comm_events);
+	if (event->attr.namespaces)
+		atomic_dec(&nr_namespaces_events);
 	if (event->attr.task)
 		atomic_dec(&nr_task_events);
 	if (event->attr.freq)
@@ -4073,6 +4109,10 @@ static void unaccount_event(struct perf_event *event)
 		dec = true;
 	if (has_branch_stack(event))
 		dec = true;
+	if (event->attr.ksymbol)
+		atomic_dec(&nr_ksymbol_events);
+	if (event->attr.bpf_event)
+		atomic_dec(&nr_bpf_events);
 
 	if (dec) {
 		if (!atomic_add_unless(&perf_sched_count, -1, 1))
@@ -4905,6 +4945,9 @@ static long _perf_ioctl(struct perf_event *event, unsigned int cmd, unsigned lon
 		rcu_read_unlock();
 		return 0;
 	}
+
+	case PERF_EVENT_IOC_QUERY_BPF:
+		return perf_event_query_prog_array(event, (void __user *)arg);
 	default:
 		return -ENOTTY;
 	}
@@ -6675,6 +6718,7 @@ static void perf_event_task(struct task_struct *task,
 void perf_event_fork(struct task_struct *task)
 {
 	perf_event_task(task, NULL, 1);
+	perf_event_namespaces(task);
 }
 
 /*
@@ -6774,6 +6818,132 @@ void perf_event_comm(struct task_struct *task, bool exec)
 	};
 
 	perf_event_comm_event(&comm_event);
+}
+
+/*
+ * namespaces tracking
+ */
+
+struct perf_namespaces_event {
+	struct task_struct		*task;
+
+	struct {
+		struct perf_event_header	header;
+
+		u32				pid;
+		u32				tid;
+		u64				nr_namespaces;
+		struct perf_ns_link_info	link_info[NR_NAMESPACES];
+	} event_id;
+};
+
+static int perf_event_namespaces_match(struct perf_event *event)
+{
+	return event->attr.namespaces;
+}
+
+static void perf_event_namespaces_output(struct perf_event *event,
+					 void *data)
+{
+	struct perf_namespaces_event *namespaces_event = data;
+	struct perf_output_handle handle;
+	struct perf_sample_data sample;
+	int ret;
+
+	if (!perf_event_namespaces_match(event))
+		return;
+
+	perf_event_header__init_id(&namespaces_event->event_id.header,
+				   &sample, event);
+	ret = perf_output_begin(&handle, event,
+				namespaces_event->event_id.header.size);
+	if (ret)
+		return;
+
+	namespaces_event->event_id.pid = perf_event_pid(event,
+							namespaces_event->task);
+	namespaces_event->event_id.tid = perf_event_tid(event,
+							namespaces_event->task);
+
+	perf_output_put(&handle, namespaces_event->event_id);
+
+	perf_event__output_id_sample(event, &handle, &sample);
+
+	perf_output_end(&handle);
+}
+
+static void perf_fill_ns_link_info(struct perf_ns_link_info *ns_link_info,
+				   struct task_struct *task,
+				   const struct proc_ns_operations *ns_ops)
+{
+	struct path ns_path;
+	struct inode *ns_inode;
+	void *error;
+
+	error = ns_get_path(&ns_path, task, ns_ops);
+	if (!error) {
+		ns_inode = ns_path.dentry->d_inode;
+		ns_link_info->dev = new_encode_dev(ns_inode->i_sb->s_dev);
+		ns_link_info->ino = ns_inode->i_ino;
+	}
+}
+
+void perf_event_namespaces(struct task_struct *task)
+{
+	struct perf_namespaces_event namespaces_event;
+	struct perf_ns_link_info *ns_link_info;
+
+	if (!atomic_read(&nr_namespaces_events))
+		return;
+
+	namespaces_event = (struct perf_namespaces_event){
+		.task	= task,
+		.event_id  = {
+			.header = {
+				.type = PERF_RECORD_NAMESPACES,
+				.misc = 0,
+				.size = sizeof(namespaces_event.event_id),
+			},
+			/* .pid */
+			/* .tid */
+			.nr_namespaces = NR_NAMESPACES,
+			/* .link_info[NR_NAMESPACES] */
+		},
+	};
+
+	ns_link_info = namespaces_event.event_id.link_info;
+
+	perf_fill_ns_link_info(&ns_link_info[MNT_NS_INDEX],
+			       task, &mntns_operations);
+
+#ifdef CONFIG_USER_NS
+	perf_fill_ns_link_info(&ns_link_info[USER_NS_INDEX],
+			       task, &userns_operations);
+#endif
+#ifdef CONFIG_NET_NS
+	perf_fill_ns_link_info(&ns_link_info[NET_NS_INDEX],
+			       task, &netns_operations);
+#endif
+#ifdef CONFIG_UTS_NS
+	perf_fill_ns_link_info(&ns_link_info[UTS_NS_INDEX],
+			       task, &utsns_operations);
+#endif
+#ifdef CONFIG_IPC_NS
+	perf_fill_ns_link_info(&ns_link_info[IPC_NS_INDEX],
+			       task, &ipcns_operations);
+#endif
+#ifdef CONFIG_PID_NS
+	perf_fill_ns_link_info(&ns_link_info[PID_NS_INDEX],
+			       task, &pidns_operations);
+#endif
+#ifdef CONFIG_CGROUPS
+	perf_fill_ns_link_info(&ns_link_info[CGROUP_NS_INDEX],
+			       task, &cgroupns_operations);
+#endif
+
+	perf_iterate_sb(perf_event_namespaces_output,
+			&namespaces_event,
+			NULL);
 }
 
 /*
@@ -7295,6 +7465,207 @@ static void perf_log_throttle(struct perf_event *event, int enable)
 	perf_output_put(&handle, throttle_event);
 	perf_event__output_id_sample(event, &handle, &sample);
 	perf_output_end(&handle);
+}
+
+/*
+ * ksymbol register/unregister tracking
+ */
+
+struct perf_ksymbol_event {
+	const char	*name;
+	int		name_len;
+	struct {
+		struct perf_event_header        header;
+		u64				addr;
+		u32				len;
+		u16				ksym_type;
+		u16				flags;
+	} event_id;
+};
+
+static int perf_event_ksymbol_match(struct perf_event *event)
+{
+	return event->attr.ksymbol;
+}
+
+static void perf_event_ksymbol_output(struct perf_event *event, void *data)
+{
+	struct perf_ksymbol_event *ksymbol_event = data;
+	struct perf_output_handle handle;
+	struct perf_sample_data sample;
+	int ret;
+
+	if (!perf_event_ksymbol_match(event))
+		return;
+
+	perf_event_header__init_id(&ksymbol_event->event_id.header,
+				   &sample, event);
+	ret = perf_output_begin(&handle, event,
+				ksymbol_event->event_id.header.size);
+	if (ret)
+		return;
+
+	perf_output_put(&handle, ksymbol_event->event_id);
+	__output_copy(&handle, ksymbol_event->name, ksymbol_event->name_len);
+	perf_event__output_id_sample(event, &handle, &sample);
+
+	perf_output_end(&handle);
+}
+
+void perf_event_ksymbol(u16 ksym_type, u64 addr, u32 len, bool unregister,
+			const char *sym)
+{
+	struct perf_ksymbol_event ksymbol_event;
+	char name[KSYM_NAME_LEN];
+	u16 flags = 0;
+	int name_len;
+
+	if (!atomic_read(&nr_ksymbol_events))
+		return;
+
+	if (ksym_type >= PERF_RECORD_KSYMBOL_TYPE_MAX ||
+	    ksym_type == PERF_RECORD_KSYMBOL_TYPE_UNKNOWN)
+		goto err;
+
+	strlcpy(name, sym, KSYM_NAME_LEN);
+	name_len = strlen(name) + 1;
+	while (!IS_ALIGNED(name_len, sizeof(u64)))
+		name[name_len++] = '\0';
+	BUILD_BUG_ON(KSYM_NAME_LEN % sizeof(u64));
+
+	if (unregister)
+		flags |= PERF_RECORD_KSYMBOL_FLAGS_UNREGISTER;
+
+	ksymbol_event = (struct perf_ksymbol_event){
+		.name = name,
+		.name_len = name_len,
+		.event_id = {
+			.header = {
+				.type = PERF_RECORD_KSYMBOL,
+				.size = sizeof(ksymbol_event.event_id) +
+					name_len,
+			},
+			.addr = addr,
+			.len = len,
+			.ksym_type = ksym_type,
+			.flags = flags,
+		},
+	};
+
+	perf_iterate_sb(perf_event_ksymbol_output, &ksymbol_event, NULL);
+	return;
+err:
+	WARN_ONCE(1, "%s: Invalid KSYMBOL type 0x%x\n", __func__, ksym_type);
+}
+
+/*
+ * bpf program load/unload tracking
+ */
+
+struct perf_bpf_event {
+	struct bpf_prog	*prog;
+	struct {
+		struct perf_event_header        header;
+		u16				type;
+		u16				flags;
+		u32				id;
+		u8				tag[BPF_TAG_SIZE];
+	} event_id;
+};
+
+static int perf_event_bpf_match(struct perf_event *event)
+{
+	return event->attr.bpf_event;
+}
+
+static void perf_event_bpf_output(struct perf_event *event, void *data)
+{
+	struct perf_bpf_event *bpf_event = data;
+	struct perf_output_handle handle;
+	struct perf_sample_data sample;
+	int ret;
+
+	if (!perf_event_bpf_match(event))
+		return;
+
+	perf_event_header__init_id(&bpf_event->event_id.header,
+				   &sample, event);
+	ret = perf_output_begin(&handle, event,
+				bpf_event->event_id.header.size);
+	if (ret)
+		return;
+
+	perf_output_put(&handle, bpf_event->event_id);
+	perf_event__output_id_sample(event, &handle, &sample);
+
+	perf_output_end(&handle);
+}
+
+static void perf_event_bpf_emit_ksymbols(struct bpf_prog *prog,
+					 enum perf_bpf_event_type type)
+{
+	bool unregister = type == PERF_BPF_EVENT_PROG_UNLOAD;
+	char sym[KSYM_NAME_LEN];
+	int i;
+
+	if (prog->aux->func_cnt == 0) {
+		bpf_get_prog_name(prog, sym);
+		perf_event_ksymbol(PERF_RECORD_KSYMBOL_TYPE_BPF,
+				   (u64)(unsigned long)prog->bpf_func,
+				   prog->jited_len, unregister, sym);
+	} else {
+		for (i = 0; i < prog->aux->func_cnt; i++) {
+			struct bpf_prog *subprog = prog->aux->func[i];
+
+			bpf_get_prog_name(subprog, sym);
+			perf_event_ksymbol(
+				PERF_RECORD_KSYMBOL_TYPE_BPF,
+				(u64)(unsigned long)subprog->bpf_func,
+				subprog->jited_len, unregister, sym);
+		}
+	}
+}
+
+void perf_event_bpf_event(struct bpf_prog *prog,
+			  enum perf_bpf_event_type type,
+			  u16 flags)
+{
+	struct perf_bpf_event bpf_event;
+
+	if (type <= PERF_BPF_EVENT_UNKNOWN ||
+	    type >= PERF_BPF_EVENT_MAX)
+		return;
+
+	switch (type) {
+	case PERF_BPF_EVENT_PROG_LOAD:
+	case PERF_BPF_EVENT_PROG_UNLOAD:
+		if (atomic_read(&nr_ksymbol_events))
+			perf_event_bpf_emit_ksymbols(prog, type);
+		break;
+	default:
+		break;
+	}
+
+	if (!atomic_read(&nr_bpf_events))
+		return;
+
+	bpf_event = (struct perf_bpf_event){
+		.prog = prog,
+		.event_id = {
+			.header = {
+				.type = PERF_RECORD_BPF_EVENT,
+				.size = sizeof(bpf_event.event_id),
+			},
+			.type = type,
+			.flags = flags,
+			.id = prog->aux->id,
+		},
+	};
+
+	BUILD_BUG_ON(BPF_TAG_SIZE % sizeof(u64));
+
+	memcpy(bpf_event.event_id.tag, prog->tag, BPF_TAG_SIZE);
+	perf_iterate_sb(perf_event_bpf_output, &bpf_event, NULL);
 }
 
 static void perf_log_itrace_start(struct perf_event *event)
@@ -8032,6 +8403,7 @@ static void bpf_overflow_handler(struct perf_event *event,
 	struct bpf_perf_event_data_kern ctx = {
 		.data = data,
 		.regs = regs,
+		.event = event,
 	};
 	int ret = 0;
 
@@ -8039,7 +8411,7 @@ static void bpf_overflow_handler(struct perf_event *event,
 	if (unlikely(__this_cpu_inc_return(bpf_prog_active) != 1))
 		goto out;
 	rcu_read_lock();
-	ret = BPF_PROG_RUN(event->prog, (void *)&ctx);
+	ret = BPF_PROG_RUN(event->prog, &ctx);
 	rcu_read_unlock();
 out:
 	__this_cpu_dec(bpf_prog_active);
@@ -8094,20 +8466,17 @@ static void perf_event_free_bpf_handler(struct perf_event *event)
 
 static int perf_event_set_bpf_prog(struct perf_event *event, u32 prog_fd)
 {
-	bool is_kprobe, is_tracepoint;
+	bool is_kprobe, is_tracepoint, is_syscall_tp;
 	struct bpf_prog *prog;
 	int ret;
 
-	if (event->attr.type == PERF_TYPE_HARDWARE ||
-	    event->attr.type == PERF_TYPE_SOFTWARE)
-		return perf_event_set_bpf_handler(event, prog_fd);
-
 	if (event->attr.type != PERF_TYPE_TRACEPOINT)
-		return -EINVAL;
+		return perf_event_set_bpf_handler(event, prog_fd);
 
 	is_kprobe = event->tp_event->flags & TRACE_EVENT_FL_UKPROBE;
 	is_tracepoint = event->tp_event->flags & TRACE_EVENT_FL_TRACEPOINT;
-	if (!is_kprobe && !is_tracepoint)
+	is_syscall_tp = is_syscall_trace_event(event->tp_event);
+	if (!is_kprobe && !is_tracepoint && !is_syscall_tp)
 		/* bpf programs can only be attached to u/kprobe or tracepoint */
 		return -EINVAL;
 
@@ -8116,13 +8485,21 @@ static int perf_event_set_bpf_prog(struct perf_event *event, u32 prog_fd)
 		return PTR_ERR(prog);
 
 	if ((is_kprobe && prog->type != BPF_PROG_TYPE_KPROBE) ||
-	    (is_tracepoint && prog->type != BPF_PROG_TYPE_TRACEPOINT)) {
+	    (is_tracepoint && prog->type != BPF_PROG_TYPE_TRACEPOINT) ||
+	    (is_syscall_tp && prog->type != BPF_PROG_TYPE_TRACEPOINT)) {
 		/* valid fd, but invalid bpf program type */
 		bpf_prog_put(prog);
 		return -EINVAL;
 	}
 
-	if (is_tracepoint) {
+	/* Kprobe override only works for kprobes, not uprobes. */
+	if (prog->kprobe_override &&
+	    !(event->tp_event->flags & TRACE_EVENT_FL_KPROBE)) {
+		bpf_prog_put(prog);
+		return -EINVAL;
+	}
+
+	if (is_tracepoint || is_syscall_tp) {
 		int off = trace_event_get_offsets(event->tp_event);
 
 		if (prog->aux->max_ctx_offset > off) {
@@ -9347,6 +9724,8 @@ static void account_event(struct perf_event *event)
 		atomic_inc(&nr_mmap_events);
 	if (event->attr.comm)
 		atomic_inc(&nr_comm_events);
+	if (event->attr.namespaces)
+		atomic_inc(&nr_namespaces_events);
 	if (event->attr.task)
 		atomic_inc(&nr_task_events);
 	if (event->attr.freq)
@@ -9359,6 +9738,10 @@ static void account_event(struct perf_event *event)
 		inc = true;
 	if (is_cgroup_event(event))
 		inc = true;
+	if (event->attr.ksymbol)
+		atomic_inc(&nr_ksymbol_events);
+	if (event->attr.bpf_event)
+		atomic_inc(&nr_bpf_events);
 
 	if (inc) {
 		if (atomic_inc_not_zero(&perf_sched_count))
@@ -10058,6 +10441,11 @@ SYSCALL_DEFINE5(perf_event_open,
 
 	if (!attr.exclude_kernel) {
 		if (perf_paranoid_kernel() && !capable(CAP_SYS_ADMIN))
+			return -EACCES;
+	}
+
+	if (attr.namespaces) {
+		if (!capable(CAP_SYS_ADMIN))
 			return -EACCES;
 	}
 
@@ -10909,6 +11297,14 @@ struct file *perf_event_get(unsigned int fd)
 	return file;
 }
 
+const struct perf_event *perf_get_event(struct file *file)
+{
+	if (file->f_op != &perf_fops)
+		return ERR_PTR(-EINVAL);
+
+	return file->private_data;
+}
+
 const struct perf_event_attr *perf_event_attrs(struct perf_event *event)
 {
 	if (!event)
@@ -11458,5 +11854,12 @@ struct cgroup_subsys perf_event_cgrp_subsys = {
 	.css_alloc	= perf_cgroup_css_alloc,
 	.css_free	= perf_cgroup_css_free,
 	.attach		= perf_cgroup_attach,
+	/*
+	 * Implicitly enable on dfl hierarchy so that perf events can
+	 * always be filtered by cgroup2 path as long as perf_event
+	 * controller is not mounted on a legacy hierarchy.
+	 */
+	.implicit_on_dfl = true,
+	.threaded	= true,
 };
 #endif /* CONFIG_CGROUP_PERF */

@@ -258,7 +258,7 @@ static struct fq_flow *fq_classify(struct sk_buff *skb, struct fq_sched_data *q)
 		skb_orphan(skb);
 	}
 
-	root = &q->fq_root[hash_32((u32)(long)sk, q->fq_trees_log)];
+	root = &q->fq_root[hash_ptr(sk, q->fq_trees_log)];
 
 	if (q->flows >= (2U << q->fq_trees_log) &&
 	    q->inactive_flows > q->flows/2)
@@ -405,9 +405,17 @@ static int fq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		q->stat_tcp_retrans++;
 	qdisc_qstats_backlog_inc(sch, skb);
 	if (fq_flow_is_detached(f)) {
+		struct sock *sk = skb->sk;
+
 		fq_flow_add_tail(&q->new_flows, f);
 		if (time_after(jiffies, f->age + q->flow_refill_delay))
 			f->credit = max_t(u32, f->credit, q->quantum);
+		if (sk && q->rate_enable) {
+			if (unlikely(smp_load_acquire(&sk->sk_pacing_status) !=
+				     SK_PACING_FQ))
+				smp_store_release(&sk->sk_pacing_status,
+						  SK_PACING_FQ);
+		}
 		q->inactive_flows--;
 	}
 
@@ -612,7 +620,7 @@ static void fq_rehash(struct fq_sched_data *q,
 				kmem_cache_free(fq_flow_cachep, of);
 				continue;
 			}
-			nroot = &new_array[hash_32((u32)(long)of->sk, new_log)];
+			nroot = &new_array[hash_ptr(of->sk, new_log)];
 
 			np = &nroot->rb_node;
 			parent = NULL;

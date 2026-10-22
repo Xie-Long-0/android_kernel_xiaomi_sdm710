@@ -3,6 +3,19 @@
 
 int sysctl_tcp_recovery __read_mostly = TCP_RACK_LOST_RETRANS;
 
+static void tcp_rack_mark_skb_lost(struct sock *sk, struct sk_buff *skb)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	tcp_skb_mark_lost_uncond_verify(tp, skb);
+	if (TCP_SKB_CB(skb)->sacked & TCPCB_SACKED_RETRANS) {
+		/* Account for retransmits that are lost again */
+		TCP_SKB_CB(skb)->sacked &= ~TCPCB_SACKED_RETRANS;
+		tp->retrans_out -= tcp_skb_pcount(skb);
+		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPLOSTRETRANSMIT);
+	}
+}
+
 /* Marks a packet lost, if some packet sent later has been (s)acked.
  * The underlying idea is similar to the traditional dupthresh and FACK
  * but they look at different metrics:
@@ -19,17 +32,11 @@ int sysctl_tcp_recovery __read_mostly = TCP_RACK_LOST_RETRANS;
  * The current version is only used after recovery starts but can be
  * easily extended to detect the first loss.
  */
-int tcp_rack_mark_lost(struct sock *sk)
+static void tcp_rack_detect_loss(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct sk_buff *skb;
-	u32 reo_wnd, prior_retrans = tp->retrans_out;
-
-	if (inet_csk(sk)->icsk_ca_state < TCP_CA_Recovery || !tp->rack.advanced)
-		return 0;
-
-	/* Reset the advanced flag to avoid unnecessary queue scanning */
-	tp->rack.advanced = 0;
+	u32 reo_wnd;
 
 	/* To be more reordering resilient, allow min_rtt/4 settling delay
 	 * (lower-bounded to 1000uS). We use min_rtt instead of the smoothed
@@ -61,13 +68,7 @@ int tcp_rack_mark_lost(struct sock *sk)
 				continue;
 
 			/* skb is lost if packet sent later is sacked */
-			tcp_skb_mark_lost_uncond_verify(tp, skb);
-			if (scb->sacked & TCPCB_SACKED_RETRANS) {
-				scb->sacked &= ~TCPCB_SACKED_RETRANS;
-				tp->retrans_out -= tcp_skb_pcount(skb);
-				NET_INC_STATS(sock_net(sk),
-					      LINUX_MIB_TCPLOSTRETRANSMIT);
-			}
+			tcp_rack_mark_skb_lost(sk, skb);
 		} else if (!(scb->sacked & TCPCB_RETRANS)) {
 			/* Original data are sent sequentially so stop early
 			 * b/c the rest are all sent after rack_sent
@@ -75,7 +76,17 @@ int tcp_rack_mark_lost(struct sock *sk)
 			break;
 		}
 	}
-	return prior_retrans - tp->retrans_out;
+}
+
+void tcp_rack_mark_lost(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	if (inet_csk(sk)->icsk_ca_state < TCP_CA_Recovery || !tp->rack.advanced)
+		return;
+	/* Reset the advanced flag to avoid unnecessary queue scanning */
+	tp->rack.advanced = 0;
+	tcp_rack_detect_loss(sk);
 }
 
 /* Record the most recently (re)sent time among the (s)acked packets */

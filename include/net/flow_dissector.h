@@ -21,6 +21,14 @@ struct flow_dissector_key_control {
 #define FLOW_DIS_FIRST_FRAG	BIT(1)
 #define FLOW_DIS_ENCAPSULATION	BIT(2)
 
+enum flow_dissect_ret {
+	FLOW_DISSECT_RET_OUT_GOOD,
+	FLOW_DISSECT_RET_OUT_BAD,
+	FLOW_DISSECT_RET_PROTO_AGAIN,
+	FLOW_DISSECT_RET_IPPROTO_AGAIN,
+	FLOW_DISSECT_RET_CONTINUE,
+};
+
 /**
  * struct flow_dissector_key_basic:
  * @thoff: Transport header offset
@@ -41,6 +49,13 @@ struct flow_dissector_key_vlan {
 	u16	vlan_id:12,
 		vlan_priority:3;
 	u16	padding;
+};
+
+struct flow_dissector_key_mpls {
+	u32	mpls_ttl:8,
+		mpls_bos:1,
+		mpls_tc:3,
+		mpls_label:20;
 };
 
 struct flow_dissector_key_keyid {
@@ -91,6 +106,24 @@ struct flow_dissector_key_addrs {
 };
 
 /**
+ * flow_dissector_key_arp:
+ *	@ports: Operation, source and target addresses for an ARP header
+ *              for Ethernet hardware addresses and IPv4 protocol addresses
+ *		sip: Sender IP address
+ *		tip: Target IP address
+ *		op:  Operation
+ *		sha: Sender hardware address
+ *		tpa: Target hardware address
+ */
+struct flow_dissector_key_arp {
+	__u32 sip;
+	__u32 tip;
+	__u8 op;
+	unsigned char sha[ETH_ALEN];
+	unsigned char tha[ETH_ALEN];
+};
+
+/**
  * flow_dissector_key_tp_ports:
  *	@ports: port numbers of Transport header
  *		src: source port number
@@ -106,6 +139,22 @@ struct flow_dissector_key_ports {
 	};
 };
 
+/**
+ * flow_dissector_key_icmp:
+ *	@ports: type and code of ICMP header
+ *		icmp: ICMP type (high) and code (low)
+ *		type: ICMP type
+ *		code: ICMP code
+ */
+struct flow_dissector_key_icmp {
+	union {
+		__be16 icmp;
+		struct {
+			u8 type;
+			u8 code;
+		};
+	};
+};
 
 /**
  * struct flow_dissector_key_eth_addrs:
@@ -118,26 +167,42 @@ struct flow_dissector_key_eth_addrs {
 	unsigned char src[ETH_ALEN];
 };
 
+/**
+ * struct flow_dissector_key_tcp:
+ * @flags: flags
+ */
+struct flow_dissector_key_tcp {
+	__be16 flags;
+};
+
 enum flow_dissector_key_id {
 	FLOW_DISSECTOR_KEY_CONTROL, /* struct flow_dissector_key_control */
 	FLOW_DISSECTOR_KEY_BASIC, /* struct flow_dissector_key_basic */
 	FLOW_DISSECTOR_KEY_IPV4_ADDRS, /* struct flow_dissector_key_ipv4_addrs */
 	FLOW_DISSECTOR_KEY_IPV6_ADDRS, /* struct flow_dissector_key_ipv6_addrs */
 	FLOW_DISSECTOR_KEY_PORTS, /* struct flow_dissector_key_ports */
+	FLOW_DISSECTOR_KEY_ICMP, /* struct flow_dissector_key_icmp */
 	FLOW_DISSECTOR_KEY_ETH_ADDRS, /* struct flow_dissector_key_eth_addrs */
 	FLOW_DISSECTOR_KEY_TIPC_ADDRS, /* struct flow_dissector_key_tipc_addrs */
+	FLOW_DISSECTOR_KEY_ARP, /* struct flow_dissector_key_arp */
 	FLOW_DISSECTOR_KEY_VLAN, /* struct flow_dissector_key_flow_vlan */
 	FLOW_DISSECTOR_KEY_FLOW_LABEL, /* struct flow_dissector_key_flow_tags */
 	FLOW_DISSECTOR_KEY_GRE_KEYID, /* struct flow_dissector_key_keyid */
 	FLOW_DISSECTOR_KEY_MPLS_ENTROPY, /* struct flow_dissector_key_keyid */
+	FLOW_DISSECTOR_KEY_ENC_KEYID, /* struct flow_dissector_key_keyid */
+	FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS, /* struct flow_dissector_key_ipv4_addrs */
+	FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS, /* struct flow_dissector_key_ipv6_addrs */
+	FLOW_DISSECTOR_KEY_ENC_CONTROL, /* struct flow_dissector_key_control */
+	FLOW_DISSECTOR_KEY_ENC_PORTS, /* struct flow_dissector_key_ports */
+	FLOW_DISSECTOR_KEY_MPLS, /* struct flow_dissector_key_mpls */
+	FLOW_DISSECTOR_KEY_TCP, /* struct flow_dissector_key_tcp */
 
 	FLOW_DISSECTOR_KEY_MAX,
 };
 
 #define FLOW_DISSECTOR_F_PARSE_1ST_FRAG		BIT(0)
-#define FLOW_DISSECTOR_F_STOP_AT_L3		BIT(1)
-#define FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL	BIT(2)
-#define FLOW_DISSECTOR_F_STOP_AT_ENCAP		BIT(3)
+#define FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL	BIT(1)
+#define FLOW_DISSECTOR_F_STOP_AT_ENCAP		BIT(2)
 
 struct flow_dissector_key {
 	enum flow_dissector_key_id key_id;
@@ -148,6 +213,11 @@ struct flow_dissector_key {
 struct flow_dissector {
 	unsigned int used_keys; /* each bit repesents presence of one key id */
 	unsigned short int offset[FLOW_DISSECTOR_KEY_MAX];
+};
+
+struct flow_keys_basic {
+	struct flow_dissector_key_control control;
+	struct flow_dissector_key_basic basic;
 };
 
 struct flow_keys {
@@ -168,7 +238,7 @@ __be32 flow_get_u32_src(const struct flow_keys *flow);
 __be32 flow_get_u32_dst(const struct flow_keys *flow);
 
 extern struct flow_dissector flow_keys_dissector;
-extern struct flow_dissector flow_keys_buf_dissector;
+extern struct flow_dissector flow_keys_basic_dissector;
 
 /* struct flow_keys_digest:
  *
@@ -212,5 +282,12 @@ flow_dissector_init_keys(struct flow_dissector_key_control *key_control,
 	memset(key_control, 0, sizeof(*key_control));
 	memset(key_basic, 0, sizeof(*key_basic));
 }
+
+struct bpf_flow_dissector {
+	struct bpf_flow_keys	*flow_keys;
+	const struct sk_buff	*skb;
+	void			*data;
+	void			*data_end;
+};
 
 #endif

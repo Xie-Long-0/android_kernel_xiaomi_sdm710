@@ -211,7 +211,7 @@ struct sock_common {
 		struct hlist_node	skc_node;
 		struct hlist_nulls_node skc_nulls_node;
 	};
-	int			skc_tx_queue_mapping;
+	unsigned short		skc_tx_queue_mapping;
 	union {
 		int		skc_incoming_cpu;
 		u32		skc_rcv_wnd;
@@ -229,12 +229,15 @@ struct sock_common {
 	/* public: */
 };
 
+struct bpf_sk_storage;
+
 /**
   *	struct sock - network layer representation of sockets
   *	@__sk_common: shared layout with inet_timewait_sock
   *	@sk_shutdown: mask of %SEND_SHUTDOWN and/or %RCV_SHUTDOWN
   *	@sk_userlocks: %SO_SNDBUF and %SO_RCVBUF settings
   *	@sk_lock:	synchronizer
+  *	@sk_kern_sock: True if sock is using kernel lock classes
   *	@sk_rcvbuf: size of receive buffer in bytes
   *	@sk_wq: sock wait queue and async head
   *	@sk_rx_dst: receive input route used by early demux
@@ -242,6 +245,7 @@ struct sock_common {
   *	@sk_policy: flow policy
   *	@sk_receive_queue: incoming packets
   *	@sk_wmem_alloc: transmit queue bytes committed
+  *	@sk_tsq_flags: TCP Small Queues flags
   *	@sk_write_queue: Packet sending queue
   *	@sk_omem_alloc: "o" is "option" or "other"
   *	@sk_wmem_queued: persistent queue size
@@ -250,8 +254,10 @@ struct sock_common {
   *	@sk_ll_usec: usecs to busypoll when there is no data
   *	@sk_allocation: allocation mode
   *	@sk_pacing_rate: Pacing rate (if supported by transport/packet scheduler)
+  *	@sk_pacing_status: Pacing status (requested, handled by sch_fq)
   *	@sk_max_pacing_rate: Maximum pacing rate (%SO_MAX_PACING_RATE)
   *	@sk_sndbuf: size of send buffer in bytes
+  *	@__sk_flags_offset: empty field used to determine location of bitfield
   *	@sk_padding: unused element for alignment
   *	@sk_no_check_tx: %SO_NO_CHECK setting, set checksum in TX packets
   *	@sk_no_check_rx: allow zero checksum in RX packets
@@ -272,6 +278,7 @@ struct sock_common {
   *	@sk_drops: raw/udp drops counter
   *	@sk_ack_backlog: current listen backlog
   *	@sk_max_ack_backlog: listen backlog set in listen()
+  *	@sk_uid: user id of owner
   *	@sk_priority: %SO_PRIORITY setting
   *	@sk_type: socket type (%SOCK_STREAM, etc)
   *	@sk_protocol: which protocol this socket belongs in this network family
@@ -287,6 +294,7 @@ struct sock_common {
   *	@sk_stamp_seq: lock for accessing sk_stamp on 32 bit architectures only
   *	@sk_tsflags: SO_TIMESTAMPING socket options
   *	@sk_tskey: counter to disambiguate concurrent tstamp requests
+  *	@sk_zckey: counter to order MSG_ZEROCOPY notifications
   *	@sk_socket: Identd and reporting IO signals
   *	@sk_user_data: RPC layer private data
   *	@sk_frag: cached page frag
@@ -344,6 +352,9 @@ struct sock {
 #define sk_rxhash		__sk_common.skc_rxhash
 
 	socket_lock_t		sk_lock;
+	atomic_t		sk_drops;
+	int			sk_rcvlowat;
+	struct sk_buff_head	sk_error_queue;
 	struct sk_buff_head	sk_receive_queue;
 	/*
 	 * The backlog queue is special, it is always used with
@@ -360,14 +371,13 @@ struct sock {
 		struct sk_buff	*tail;
 	} sk_backlog;
 #define sk_rmem_alloc sk_backlog.rmem_alloc
-	int			sk_forward_alloc;
 
-	__u32			sk_txhash;
+	int			sk_forward_alloc;
 #ifdef CONFIG_NET_RX_BUSY_POLL
-	unsigned int		sk_napi_id;
 	unsigned int		sk_ll_usec;
+	/* ===== mostly read cache line ===== */
+	unsigned int		sk_napi_id;
 #endif
-	atomic_t		sk_drops;
 	int			sk_rcvbuf;
 
 	struct sk_filter __rcu	*sk_filter;
@@ -380,18 +390,54 @@ struct sock {
 #endif
 	struct dst_entry __rcu	*sk_rx_dst;
 	struct dst_entry __rcu	*sk_dst_cache;
-	/* Note: 32bit hole on 64bit arches */
-	atomic_t		sk_wmem_alloc;
 	atomic_t		sk_omem_alloc;
 	int			sk_sndbuf;
+
+	/* ===== cache line for TX ===== */
+	int			sk_wmem_queued;
+	atomic_t		sk_wmem_alloc;
+	unsigned long		sk_tsq_flags;
+	struct sk_buff		*sk_send_head;
 	struct sk_buff_head	sk_write_queue;
+	__s32			sk_peek_off;
+	int			sk_write_pending;
+	u32			sk_pacing_status; /* see enum sk_pacing */
+	long			sk_sndtimeo;
+	struct timer_list	sk_timer;
+	__u32			sk_priority;
+	__u32			sk_mark;
+	u32			sk_pacing_rate; /* bytes per second */
+	u32			sk_max_pacing_rate;
+	struct page_frag	sk_frag;
+	netdev_features_t	sk_route_caps;
+	netdev_features_t	sk_route_nocaps;
+	int			sk_gso_type;
+	unsigned int		sk_gso_max_size;
+	gfp_t			sk_allocation;
+	__u32			sk_txhash;
 
 	/*
 	 * Because of non atomicity rules, all
 	 * changes are protected by socket lock.
 	 */
+	unsigned int		__sk_flags_offset[0];
+#ifdef __BIG_ENDIAN_BITFIELD
+#define SK_FL_PROTO_SHIFT  16
+#define SK_FL_PROTO_MASK   0x00ff0000
+
+#define SK_FL_TYPE_SHIFT   0
+#define SK_FL_TYPE_MASK    0x0000ffff
+#else
+#define SK_FL_PROTO_SHIFT  8
+#define SK_FL_PROTO_MASK   0x0000ff00
+
+#define SK_FL_TYPE_SHIFT   16
+#define SK_FL_TYPE_MASK    0xffff0000
+#endif
+
 	kmemcheck_bitfield_begin(flags);
-	unsigned int		sk_padding : 2,
+	unsigned int		sk_padding : 1,
+				sk_kern_sock : 1,
 				sk_no_check_tx : 1,
 				sk_no_check_rx : 1,
 				sk_userlocks : 4,
@@ -400,34 +446,20 @@ struct sock {
 #define SK_PROTOCOL_MAX U8_MAX
 	kmemcheck_bitfield_end(flags);
 
-	int			sk_wmem_queued;
-	gfp_t			sk_allocation;
-	u32			sk_pacing_rate; /* bytes per second */
-	u32			sk_max_pacing_rate;
-	netdev_features_t	sk_route_caps;
-	netdev_features_t	sk_route_nocaps;
-	int			sk_gso_type;
-	unsigned int		sk_gso_max_size;
 	u16			sk_gso_max_segs;
-	int			sk_rcvlowat;
 	unsigned long	        sk_lingertime;
-	struct sk_buff_head	sk_error_queue;
 	struct proto		*sk_prot_creator;
 	rwlock_t		sk_callback_lock;
 	int			sk_err,
 				sk_err_soft;
 	u32			sk_ack_backlog;
 	u32			sk_max_ack_backlog;
-	__u32			sk_priority;
-	__u32			sk_mark;
 	kuid_t			sk_uid;
 	spinlock_t		sk_peer_lock;
 	struct pid		*sk_peer_pid;
 	const struct cred	*sk_peer_cred;
 
 	long			sk_rcvtimeo;
-	long			sk_sndtimeo;
-	struct timer_list	sk_timer;
 	ktime_t			sk_stamp;
 #if BITS_PER_LONG==32
 	seqlock_t		sk_stamp_seq;
@@ -435,12 +467,9 @@ struct sock {
 	u16			sk_tsflags;
 	u8			sk_shutdown;
 	u32			sk_tskey;
+	atomic_t		sk_zckey;
 	struct socket		*sk_socket;
 	void			*sk_user_data;
-	struct page_frag	sk_frag;
-	struct sk_buff		*sk_send_head;
-	__s32			sk_peek_off;
-	int			sk_write_pending;
 #ifdef CONFIG_SECURITY
 	void			*sk_security;
 #endif
@@ -454,7 +483,16 @@ struct sock {
 						  struct sk_buff *skb);
 	void                    (*sk_destruct)(struct sock *sk);
 	struct sock_reuseport __rcu	*sk_reuseport_cb;
+#ifdef CONFIG_BPF_SYSCALL
+	struct bpf_sk_storage __rcu	*sk_bpf_storage;
+#endif
 	struct rcu_head		sk_rcu;
+};
+
+enum sk_pacing {
+	SK_PACING_NONE		= 0,
+	SK_PACING_NEEDED	= 1,
+	SK_PACING_FQ		= 2,
 };
 
 #define __sk_user_data(sk) ((*((void __rcu **)&(sk)->sk_user_data)))
@@ -932,14 +970,16 @@ static inline void sock_rps_reset_rxhash(struct sock *sk)
 #endif
 }
 
-#define sk_wait_event(__sk, __timeo, __condition)			\
+#define sk_wait_event(__sk, __timeo, __condition, __wait)		\
 	({	int __rc;						\
 		release_sock(__sk);					\
 		__rc = __condition;					\
 		if (!__rc) {						\
-			*(__timeo) = schedule_timeout(*(__timeo));	\
+			*(__timeo) = wait_woken(__wait,			\
+						TASK_INTERRUPTIBLE,	\
+						*(__timeo));		\
 		}							\
-		sched_annotate_sleep();						\
+		sched_annotate_sleep();					\
 		lock_sock(__sk);					\
 		__rc = __condition;					\
 		__rc;							\
@@ -973,7 +1013,7 @@ struct raw_hashinfo;
 struct module;
 
 /*
- * caches using SLAB_DESTROY_BY_RCU should let .next pointer from nulls nodes
+ * caches using SLAB_TYPESAFE_BY_RCU should let .next pointer from nulls nodes
  * un-modified. Special care is taken when initializing object to zero.
  */
 static inline void sk_prot_clear_nulls(struct sock *sk, int size)
@@ -990,12 +1030,16 @@ static inline void sk_prot_clear_nulls(struct sock *sk, int size)
 struct proto {
 	void			(*close)(struct sock *sk,
 					long timeout);
+	int			(*pre_connect)(struct sock *sk,
+					struct sockaddr *uaddr,
+					int addr_len);
 	int			(*connect)(struct sock *sk,
 					struct sockaddr *uaddr,
 					int addr_len);
 	int			(*disconnect)(struct sock *sk, int flags);
 
-	struct sock *		(*accept)(struct sock *sk, int flags, int *err);
+	struct sock *		(*accept)(struct sock *sk, int flags, int *err,
+					  bool kern);
 
 	int			(*ioctl)(struct sock *sk, int cmd,
 					 unsigned long arg);
@@ -1047,6 +1091,7 @@ struct proto {
 #endif
 
 	bool			(*stream_memory_free)(const struct sock *sk);
+	bool			(*stream_memory_read)(const struct sock *sk);
 	/* Memory pressure */
 	void			(*enter_memory_pressure)(struct sock *sk);
 	atomic_long_t		*memory_allocated;	/* Current allocated memory. */
@@ -1491,11 +1536,14 @@ struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
 void sk_free(struct sock *sk);
 void sk_destruct(struct sock *sk);
 struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority);
+void sk_free_unlock_clone(struct sock *sk);
 
 struct sk_buff *sock_wmalloc(struct sock *sk, unsigned long size, int force,
 			     gfp_t priority);
 void __sock_wfree(struct sk_buff *skb);
 void sock_wfree(struct sk_buff *skb);
+struct sk_buff *sock_omalloc(struct sock *sk, unsigned long size,
+			     gfp_t priority);
 void skb_orphan_partial(struct sk_buff *skb);
 void sock_rfree(struct sk_buff *skb);
 void sock_efree(struct sk_buff *skb);
@@ -1537,7 +1585,7 @@ int sock_cmsg_send(struct sock *sk, struct msghdr *msg,
 int sock_no_bind(struct socket *, struct sockaddr *, int);
 int sock_no_connect(struct socket *, struct sockaddr *, int, int);
 int sock_no_socketpair(struct socket *, struct socket *);
-int sock_no_accept(struct socket *, struct socket *, int);
+int sock_no_accept(struct socket *, struct socket *, int, bool);
 int sock_no_getname(struct socket *, struct sockaddr *, int *, int);
 unsigned int sock_no_poll(struct file *, struct socket *,
 			  struct poll_table_struct *);
@@ -1547,11 +1595,14 @@ int sock_no_shutdown(struct socket *, int);
 int sock_no_getsockopt(struct socket *, int , int, char __user *, int __user *);
 int sock_no_setsockopt(struct socket *, int, int, char __user *, unsigned int);
 int sock_no_sendmsg(struct socket *, struct msghdr *, size_t);
+int sock_no_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t len);
 int sock_no_recvmsg(struct socket *, struct msghdr *, size_t, int);
 int sock_no_mmap(struct file *file, struct socket *sock,
 		 struct vm_area_struct *vma);
 ssize_t sock_no_sendpage(struct socket *sock, struct page *page, int offset,
 			 size_t size, int flags);
+ssize_t sock_no_sendpage_locked(struct sock *sk, struct page *page,
+				int offset, size_t size, int flags);
 
 /*
  * Functions to fill in entries in struct proto_ops when a protocol
@@ -1623,17 +1674,25 @@ static inline int sk_receive_skb(struct sock *sk, struct sk_buff *skb,
 
 static inline void sk_tx_queue_set(struct sock *sk, int tx_queue)
 {
+	/* sk_tx_queue_mapping accept only upto a 16-bit value */
+	if (WARN_ON_ONCE((unsigned short)tx_queue >= USHRT_MAX))
+		return;
 	sk->sk_tx_queue_mapping = tx_queue;
 }
 
+#define NO_QUEUE_MAPPING	USHRT_MAX
+
 static inline void sk_tx_queue_clear(struct sock *sk)
 {
-	sk->sk_tx_queue_mapping = -1;
+	sk->sk_tx_queue_mapping = NO_QUEUE_MAPPING;
 }
 
 static inline int sk_tx_queue_get(const struct sock *sk)
 {
-	return sk ? sk->sk_tx_queue_mapping : -1;
+	if (sk && sk->sk_tx_queue_mapping != NO_QUEUE_MAPPING)
+		return sk->sk_tx_queue_mapping;
+
+	return -1;
 }
 
 static inline void sk_set_socket(struct sock *sk, struct socket *sock)
@@ -2327,6 +2386,8 @@ bool sk_ns_capable(const struct sock *sk,
 		   struct user_namespace *user_ns, int cap);
 bool sk_capable(const struct sock *sk, int cap);
 bool sk_net_capable(const struct sock *sk, int cap);
+
+void sk_get_meminfo(const struct sock *sk, u32 *meminfo);
 
 extern __u32 sysctl_wmem_max;
 extern __u32 sysctl_rmem_max;

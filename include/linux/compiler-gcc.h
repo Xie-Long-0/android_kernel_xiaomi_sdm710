@@ -235,8 +235,13 @@
 	    ".long 1b\t\n"						\
 	    ".popsection\t\n");						\
 })
+
+/* Annotate a C jump table to allow objtool to follow the code flow */
+#define __annotate_jump_table __section(".rodata..c_jump_table")
+
 #else
 #define annotate_unreachable()
+#define __annotate_jump_table
 #endif
 
 /*
@@ -336,6 +341,14 @@
  * Conflicts with inlining: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=67368
  */
 #define __no_sanitize_address __attribute__((no_sanitize_address))
+#endif
+
+#if GCC_VERSION >= 50100
+/*
+ * Mark structures as requiring designated initializers.
+ * https://gcc.gnu.org/onlinedocs/gcc/Designated-Inits.html
+ */
+#define __designated_init __attribute__((designated_init))
 #endif
 
 #endif	/* gcc version >= 40000 specific checks */

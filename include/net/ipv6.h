@@ -21,6 +21,7 @@
 #include <net/flow.h>
 #include <net/flow_dissector.h>
 #include <net/snmp.h>
+#include <net/netns/hash.h>
 
 #define SIN6_LEN_RFC2133	24
 
@@ -575,6 +576,22 @@ static inline bool ipv6_addr_v4mapped(const struct in6_addr *a)
 					cpu_to_be32(0x0000ffff))) == 0UL;
 }
 
+static inline u32 ipv6_portaddr_hash(const struct net *net,
+				     const struct in6_addr *addr6,
+				     unsigned int port)
+{
+	unsigned int hash, mix = net_hash_mix(net);
+
+	if (ipv6_addr_any(addr6))
+		hash = jhash_1word(0, mix);
+	else if (ipv6_addr_v4mapped(addr6))
+		hash = jhash_1word((__force u32)addr6->s6_addr32[3], mix);
+	else
+		hash = jhash2((__force u32 *)addr6->s6_addr32, 4, mix);
+
+	return hash ^ port;
+}
+
 /*
  * Check for a RFC 4843 ORCHID address
  * (Overlay Routable Cryptographic Hash Identifiers)
@@ -936,6 +953,8 @@ void ipv6_local_error(struct sock *sk, int err, struct flowi6 *fl6, u32 info);
 void ipv6_local_rxpmtu(struct sock *sk, struct flowi6 *fl6, u32 mtu);
 
 int inet6_release(struct socket *sock);
+int __inet6_bind(struct sock *sock, struct sockaddr *uaddr, int addr_len,
+		 bool force_bind_address_no_port, bool with_lock);
 int inet6_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len);
 int inet6_getname(struct socket *sock, struct sockaddr *uaddr, int *uaddr_len,
 		  int peer);
