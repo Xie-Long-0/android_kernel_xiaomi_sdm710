@@ -203,7 +203,7 @@ static void kernfs_refresh_inode(struct kernfs_node *kn, struct inode *inode)
 int kernfs_iop_getattr(const struct path *path, struct kstat *stat,
 		       u32 request_mask, unsigned int query_flags)
 {
-	struct kernfs_node *kn = path->dentry->d_fsdata;
+	struct kernfs_node *kn = kernfs_dentry_node(path->dentry);
 	struct inode *inode = d_inode(path->dentry);
 
 	mutex_lock(&kernfs_mutex);
