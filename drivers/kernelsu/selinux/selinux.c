@@ -207,3 +207,25 @@ bool is_init(const struct cred *cred)
 {
     return is_sid_match(cred, cached_init_sid, INIT_CONTEXT);
 }
+
+/*
+ * ksud lives on /data, which is mounted nosuid, and init execs it with an
+ * explicit u:r:ksu:s0 context. SELinux rejects that non-bounded domain
+ * transition in check_nnp_nosuid() with -EACCES, which breaks the
+ * services/boot-completed stages once the execve hook has been stopped.
+ */
+bool is_ksu_transition(const struct task_security_struct *old_tsec,
+                       const struct task_security_struct *new_tsec)
+{
+    u32 init_sid, su_sid;
+
+    if (cached_init_sid && cached_su_sid) {
+        init_sid = cached_init_sid;
+        su_sid = cached_su_sid;
+    } else if (security_secctx_to_secid(INIT_CONTEXT, strlen(INIT_CONTEXT), &init_sid) ||
+               security_secctx_to_secid(KERNEL_SU_CONTEXT, strlen(KERNEL_SU_CONTEXT), &su_sid)) {
+        return false;
+    }
+
+    return old_tsec->sid == init_sid && new_tsec->sid == su_sid;
+}
